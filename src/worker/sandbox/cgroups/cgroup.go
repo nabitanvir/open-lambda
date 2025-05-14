@@ -37,20 +37,8 @@ func (cg *CgroupImpl) Release() {
 	// if there's room in the recycled channel, add it there.
 	// Otherwise, just delete it.
 	if common.Conf.Features.Reuse_cgroups {
-		for i := 100; i >= 0; i-- {
-			pids, err := cg.GetPIDs()
-			if err != nil {
-				panic(err)
-			} else if len(pids) > 0 {
-				if i == 0 {
-					panic(fmt.Errorf("Cannot release cgroup that contains processes: %v", pids))
-				}
-
-				cg.printf("cgroup Rmdir failed, trying again in 5ms")
-				time.Sleep(5 * time.Millisecond)
-			} else {
-				break
-			}
+		if err := cg.waitUntilCgroupEmpty(5 * time.Second); err != nil {
+    			panic(fmt.Errorf("Cannot release cgroup (still populated): %v", err))
 		}
 
 		select {
@@ -69,19 +57,14 @@ func (cg *CgroupImpl) Release() {
 func (cg *CgroupImpl) Destroy() {
 	gpath := cg.GroupPath()
 	cg.printf("Destroying cgroup with path \"%s\"", gpath)
-
-	for i := 100; i >= 0; i-- {
-		if err := syscall.Rmdir(gpath); err != nil {
-			if i == 0 {
-				panic(fmt.Errorf("Rmdir(2) %s: %s", gpath, err))
-			}
-
-			cg.printf("cgroup Rmdir failed, trying again in 5ms")
-			time.Sleep(5 * time.Millisecond)
-		} else {
-			break
-		}
+	if err := cg.waitUntilCgroupEmpty(5 * time.Second); err != nil {
+    		panic(fmt.Errorf("Cannot destroy cgroup (still populated): %v", err))
 	}
+
+	if err := syscall.Rmdir(gpath); err != nil {
+   		panic(fmt.Errorf("Rmdir(2) %s: %s", gpath, err))
+	}
+
 }
 
 // GroupPath returns the path to the Cgroup pool for OpenLambda
@@ -190,26 +173,7 @@ func (cg *CgroupImpl) AddPid(pid string) error {
 
 func (cg *CgroupImpl) setFreezeState(state int64) error {
 	cg.WriteInt("cgroup.freeze", state)
-
-	timeout := 5 * time.Second
-
-	start := time.Now()
-	for {
-		freezerState, err := cg.TryReadInt("cgroup.freeze")
-		if err != nil {
-			return fmt.Errorf("failed to check self_freezing state :: %v", err)
-		}
-
-		if freezerState == state {
-			return nil
-		}
-
-		if time.Since(start) > timeout {
-			return fmt.Errorf("cgroup stuck on %v after %v (should be %v)", freezerState, timeout, state)
-		}
-
-		time.Sleep(1 * time.Millisecond)
-	}
+	return cg.waitUntilFrozen(state, 5*time.Second)
 }
 
 // get mem usage in MB
@@ -331,3 +295,52 @@ func (cg *CgroupImpl) DebugString() string {
 	}
 	return s
 }
+
+func (cg *CgroupImpl) waitUntilCgroupEmpty(timeout time.Duration) error {
+	start := time.Now()
+	for {
+		path := cg.ResourcePath("cgroup.events")
+		data, err := ioutil.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read cgroup.events: %v", err)
+		}
+
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "populated ") {
+				parts := strings.Fields(line)
+				if len(parts) != 2 {
+					return fmt.Errorf("unexpected format in cgroup.events: %q", line)
+				}
+				if parts[1] == "0" {
+					return nil
+				}
+			}
+		}
+
+		if time.Since(start) > timeout {
+			return fmt.Errorf("timeout waiting for cgroup to become unpopulated")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (cg *CgroupImpl) waitUntilFrozen(expected int64, timeout time.Duration) error {
+	start := time.Now()
+	for {
+		val, err := cg.TryReadInt("cgroup.freeze")
+		if err != nil {
+			return fmt.Errorf("error reading cgroup.freeze: %v", err)
+		}
+		if val == expected {
+			return nil
+		}
+
+		if time.Since(start) > timeout {
+			return fmt.Errorf("timeout waiting for cgroup.freeze == %d", expected)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+
